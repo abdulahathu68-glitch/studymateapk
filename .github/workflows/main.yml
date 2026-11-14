@@ -1,0 +1,133 @@
+name: Build StudyMate Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_REF: master
+  NDK_VERSION: '28.2.13676358'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;$NDK_VERSION"
+
+      - name: Generate Android project if needed
+        run: |
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            flutter create --platforms=android --project-name studymate_ai .
+          fi
+          test -f android/app/build.gradle || test -f android/app/build.gradle.kts
+
+      - name: Patch Android build for native llama.cpp
+        run: python3 scripts/patch_android.py
+
+      - name: Fetch llama.cpp
+        run: |
+          rm -rf android/app/src/main/cpp/llama.cpp
+          git clone --depth 1 --branch "$LLAMA_REF" \
+            https://github.com/ggml-org/llama.cpp \
+            android/app/src/main/cpp/llama.cpp
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Patch file_picker compileSdk to 36
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          roots = [
+              Path.home() / ".pub-cache" / "hosted" / "pub.dev",
+              Path.home() / ".pub-cache" / "hosted" / "pub.dartlang.org",
+          ]
+          candidates = []
+          for root in roots:
+              if root.exists():
+                  candidates.extend(root.glob("file_picker-*/android/build.gradle"))
+                  candidates.extend(root.glob("file_picker-*/android/build.gradle.kts"))
+
+          if not candidates:
+              print("ERROR: Could not find file_picker Android Gradle file in Pub cache.")
+              sys.exit(1)
+
+          changed = False
+          for path in candidates:
+              original = path.read_text()
+              updated, _ = re.subn(
+                  r"(?m)^(\s*compileSdkVersion\s+)(?:flutter\.compileSdkVersion|\d+)(\s*(?://.*)?)$",
+                  r"\g<1>36\g<2>",
+                  original,
+              )
+              updated, _ = re.subn(
+                  r"(?m)^(\s*compileSdk\s*(?:=\s*)?)(?:flutter\.compileSdkVersion|\d+)(\s*(?://.*)?)$",
+                  r"\g<1>36\g<2>",
+                  updated,
+              )
+              if updated != original:
+                  path.write_text(updated)
+                  changed = True
+                  print(f"Patched {path}")
+
+          if not changed:
+              print("ERROR: file_picker compileSdk line was not changed.")
+              sys.exit(1)
+          PY
+
+      - name: Verify Flutter dependencies
+        run: flutter pub deps --style=compact
+
+      - name: Analyze Flutter code
+        run: flutter analyze --no-pub
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StudyMate-AI-Android-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      - name: Publish Android release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/app-release.apk
