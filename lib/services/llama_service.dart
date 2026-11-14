@@ -6,8 +6,6 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 import '../core/constants.dart';
-import '../core/identity.dart';
-import 'model_manager.dart';
 
 /// Runs the local model through llama-server. Nothing leaves this PC.
 class LlamaService {
@@ -15,7 +13,6 @@ class LlamaService {
   int? _port;
   String? _executable;
   bool _vision = false;
-  final List<String> _log = [];
   int _contextSize = 6144;
   /// 'length' means the last reply was cut off by the token limit.
   String? lastFinishReason;
@@ -60,8 +57,7 @@ class LlamaService {
       throw Exception('The local AI server is supported on Windows and Linux.');
     }
     _historyBudget = lowMemory ? 2000 : 3000;
-    final savedCtx = await ModelManager.contextSize();
-    _contextSize = lowMemory && savedCtx > 4096 ? 4096 : savedCtx;
+    _contextSize = lowMemory ? 4096 : 6144;
     final binName = Platform.isWindows ? 'llama-server.exe' : 'llama-server';
     var exe = '${File(Platform.resolvedExecutable).parent.path}${Platform.pathSeparator}bin${Platform.pathSeparator}$binName';
     if (!await File(exe).exists() && !Platform.isWindows) {
@@ -72,12 +68,23 @@ class LlamaService {
       throw Exception(
           'llama-server is missing. Put $binName in the app bin folder, or install llama.cpp so it is on the PATH.');
     }
-    final active = await ModelManager.activeFiles();
-    if (active == null) {
-      throw Exception('Choose a model in Models, download it, then press Load model.');
+    final dir = Directory(await _modelDir());
+    if (!await dir.exists()) {
+      throw Exception('Download a model first from the Models screen.');
     }
-    final model = File(active.model);
-    final mmproj = active.vision == null ? null : File(active.vision!);
+    final files = await dir
+        .list()
+        .where((e) => e is File && e.path.toLowerCase().endsWith('.gguf'))
+        .cast<File>()
+        .toList();
+    final models = files.where((f) => !f.path.toLowerCase().contains('mmproj')).toList()
+      ..sort((a, b) => _modelRank(a.path).compareTo(_modelRank(b.path)));
+    final projectors = files.where((f) => f.path.toLowerCase().contains('mmproj')).toList()
+      ..sort((a, b) => (a.path.toLowerCase().contains('q8_0') ? 0 : 1)
+          .compareTo(b.path.toLowerCase().contains('q8_0') ? 0 : 1));
+    if (models.isEmpty) throw Exception('Download a model first from the Models screen.');
+    final model = models.first;
+    final mmproj = projectors.isEmpty ? null : projectors.first;
 
     final port = await _freePort();
     final cores = (Platform.numberOfProcessors ~/ 2).clamp(2, 8);
@@ -94,9 +101,6 @@ class LlamaService {
       '--no-webui',
     ];
     _process = await Process.start(exe, args, runInShell: false);
-    _log.clear();
-    _process!.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen(_addLog);
-    _process!.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen(_addLog);
     _port = port;
     _vision = useVision;
     _executable = exe;
@@ -109,7 +113,7 @@ class LlamaService {
     final until = DateTime.now().add(const Duration(minutes: 2));
     while (DateTime.now().isBefore(until)) {
       if (_process == null) {
-        throw Exception(_startError('The AI engine stopped while starting.'));
+        throw Exception('The local AI server stopped while starting. Check Windows antivirus and available RAM.');
       }
       try {
         final r = await http
@@ -120,22 +124,7 @@ class LlamaService {
       await Future<void>.delayed(const Duration(milliseconds: 700));
     }
     await stop();
-    throw Exception(_startError('The AI engine took too long to start.'));
-  }
-
-  void _addLog(String line) {
-    if (line.trim().isEmpty) return;
-    _log.add(line.trim());
-    if (_log.length > 40) _log.removeAt(0);
-  }
-
-  /// Adds the engine's last messages to a startup error, so the real cause is visible.
-  String _startError(String head) {
-    final tail = _log.length > 12 ? _log.sublist(_log.length - 12) : List<String>.from(_log);
-    if (tail.isEmpty) return '$head No output was received from the engine.';
-    var text = tail.join(' | ');
-    if (text.length > 700) text = text.substring(text.length - 700);
-    return '$head Engine said: $text';
+    throw Exception('The local AI server took too long to start. Try Low-memory mode or close some apps.');
   }
 
   /// Keeps the newest messages that fit the budget so long chats do not overflow the context.
@@ -158,7 +147,7 @@ class LlamaService {
       ' Answer using the REFERENCE EXCERPTS from the student\'s textbooks. Use only facts found in those excerpts, cite each fact as [book, page], and if the excerpts do not contain the answer, say clearly that the book does not cover it. Do not guess.';
 
   static const _voiceInstruction =
-      ' Voice mode: answer in at most two short, plain sentences with no lists or formatting, because the answer will be read aloud.';
+      ' Voice mode: answer in at most three short, plain sentences with no lists or formatting, because the answer will be read aloud.';
 
   static const _multiQuestionInstruction =
       ' The student has several questions. Answer every numbered question in order, completely, and do not stop early.';
@@ -182,7 +171,7 @@ class LlamaService {
   }) {
     final n = questionCount(question);
     final words = question.split(RegExp(r'\s+')).where((w) => w.isNotEmpty).length;
-    final wanted = (thinker ? 500 : 300) + n * (thinker ? 220 : 140) + words ~/ 2;
+    final wanted = (thinker ? 500 : 300) + n * (thinker ? 220 : 140) + words ~/ 6;
     final room = contextSize - promptChars ~/ 3 - 128;
     var result = wanted < room ? wanted : room;
     if (result < 256) result = 256;
@@ -202,7 +191,6 @@ class LlamaService {
     bool thinker = false,
     bool voice = false,
     String? references,
-    bool deepThink = false,
   }) async* {
     if (!running) throw Exception('Load your model from the Models screen first.');
     if (imageDataUri != null && !_vision) {
@@ -229,7 +217,7 @@ class LlamaService {
     final messages = <Map<String, dynamic>>[
       {
         'role': 'system',
-        'content': '$studyMateSystemPrompt $studentContext'
+        'content': '$tutorSystemPrompt $studentContext'
             '${thinker ? _thinkerInstruction : ''}${voice ? _voiceInstruction : (qCount > 1 ? _multiQuestionInstruction : '')}'
             '${references == null ? '' : '$_referenceInstruction\n\nREFERENCE EXCERPTS:\n$references'}',
       },
@@ -259,8 +247,7 @@ class LlamaService {
         'top_p': 0.8,
         'top_k': 20,
         'repeat_penalty': 1.1,
-        'chat_template_kwargs': {'enable_thinking': deepThink},
-        'max_tokens': voice && maxTokens > 90 ? 90 : maxTokens,
+        'max_tokens': voice && maxTokens > 160 ? 160 : maxTokens,
       });
 
     final response = await _client.send(request).timeout(const Duration(seconds: 60));

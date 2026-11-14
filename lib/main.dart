@@ -12,8 +12,6 @@ import 'package:intl/intl.dart';
 
 import 'core/constants.dart';
 import 'services/book_store.dart';
-import 'ui/models_page.dart';
-import 'ui/live_voice_page.dart';
 import 'services/textbook_downloader.dart';
 import 'services/chat_store.dart';
 import 'services/llama_service.dart';
@@ -45,36 +43,10 @@ class _StudyMateAppState extends State<StudyMateApp> {
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: brandBlue),
         scaffoldBackgroundColor: pageBackground,
-        cardTheme: CardThemeData(
+        cardTheme: const CardThemeData(
           color: Colors.white,
           elevation: 0,
           margin: EdgeInsets.zero,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFFE2E8F0)),
-          ),
-        ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          ),
-        ),
-        navigationRailTheme: NavigationRailThemeData(
-          backgroundColor: Colors.white,
-          indicatorColor: brandBlue.withValues(alpha: .14),
-          selectedIconTheme: const IconThemeData(color: brandBlue),
-          selectedLabelTextStyle: const TextStyle(color: brandBlue, fontWeight: FontWeight.w600),
-        ),
-        navigationBarTheme: NavigationBarThemeData(
-          backgroundColor: Colors.white,
-          indicatorColor: brandBlue.withValues(alpha: .14),
         ),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
@@ -88,19 +60,6 @@ class _StudyMateAppState extends State<StudyMateApp> {
       darkTheme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: brandBlue, brightness: Brightness.dark),
-        cardTheme: CardThemeData(
-          elevation: 0,
-          margin: EdgeInsets.zero,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: BorderSide(color: Colors.white.withValues(alpha: .08)),
-          ),
-        ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-        ),
       ),
       home: MainShell(
         onThemeChanged: (dark) =>
@@ -541,7 +500,7 @@ class _MainShellState extends State<MainShell> {
       ),
       ProgressPage(sessions: _sessions, completed: _completed, notes: _notes),
       ModelsPage(
-        voice: _voice,
+        service: _models,
         loaded: _llama.running,
         status: _modelMessage,
         lowMemory: _lowMemory,
@@ -1026,7 +985,6 @@ class _TutorPageState extends State<TutorPage> {
   bool _useBooks = true;
   Completer<void>? _answerDone;
   bool _voiceOn = false;
-  bool _dictating = false;
   String _voiceStatus = '';
   String? _error;
   String? _imageName;
@@ -1224,7 +1182,7 @@ class _TutorPageState extends State<TutorPage> {
       return;
     }
 
-    final text = typed.isEmpty ? 'Please explain this image.' : _expandCommand(typed);
+    final text = typed.isEmpty ? 'Please explain this image.' : typed;
     final imageUri = _imageUri;
     final shown = imageUri == null
         ? text
@@ -1259,7 +1217,7 @@ class _TutorPageState extends State<TutorPage> {
     final done = Completer<void>();
     _answerDone = done;
     _sub = widget.llama
-        .askStream(askHistory, widget.profile, imageDataUri: imageUri, deepThink: _thinker, voice: voice, references: refs)
+        .askStream(askHistory, widget.profile, imageDataUri: imageUri, thinker: _thinker, voice: voice, references: refs)
         .listen(
       (piece) {
         if (!mounted) return;
@@ -1365,11 +1323,6 @@ class _TutorPageState extends State<TutorPage> {
                   icon: const Icon(Icons.upload_file),
                   label: const Text('Import PDF'),
                 ),
-                OutlinedButton.icon(
-                  onPressed: _downloadVoiceModel,
-                  icon: const Icon(Icons.record_voice_over_outlined),
-                  label: const Text('Download voice model (about 150 MB)'),
-                ),
                 const SizedBox(height: 12),
                 const SelectableText(
                   'Official Class 10 books: https://www.tntextbooks.in/p/10th-books.html',
@@ -1380,113 +1333,6 @@ class _TutorPageState extends State<TutorPage> {
         ),
       ),
     );
-  }
-
-  // ---------- Slash commands ----------
-
-  /// Expands /paragraph, /questions, /notes and /assignment into a full instruction.
-  String _expandCommand(String input) {
-    final m = RegExp(r'^/(paragraph|questions|notes|assignment)\b\s*', caseSensitive: false)
-        .firstMatch(input);
-    if (m == null) return input;
-    const tasks = {
-      'paragraph': 'Explain the following paragraph in clear, simple language, step by step, and list its key ideas.',
-      'questions': 'Write 10 exam-style questions with model answers, based only on the following text.',
-      'notes': 'Make short, well-structured study notes with headings and bullet points from the following text.',
-      'assignment': 'Create an assignment with 5 questions of increasing difficulty and an answer key, based only on the following text.',
-    };
-    final task = tasks[m.group(1)!.toLowerCase()]!;
-    final body = input.substring(m.end).trim();
-    return body.isEmpty ? task : '$task\n\n$body';
-  }
-
-  // ---------- Dictation and audio files ----------
-
-  void _addToInput(String text) {
-    if (text.isEmpty) return;
-    _input.text = _input.text.isEmpty ? text : '${_input.text} $text';
-  }
-
-  /// Records 8 seconds and puts the recognised words into the input box. It does not send them.
-  Future<void> _dictate() async {
-    final problem = await widget.voice.setupProblem();
-    if (problem != null) {
-      _showError(problem);
-      return;
-    }
-    setState(() {
-      _dictating = true;
-      _voiceStatus = 'Listening for 8 seconds... speak now';
-      _error = null;
-    });
-    try {
-      final text = await widget.voice.listenOnce(8);
-      if (!mounted) return;
-      if (text.isEmpty) {
-        _showError('No speech was recognised. Speak clearly, close to the microphone, and try again.');
-      } else {
-        _addToInput(text);
-      }
-    } catch (e) {
-      _showError(e.toString().replaceFirst('Exception: ', ''));
-    } finally {
-      if (mounted) {
-        setState(() {
-          _dictating = false;
-          _voiceStatus = '';
-        });
-      }
-    }
-  }
-
-  Future<void> _transcribeFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['wav', 'mp3', 'm4a', 'ogg', 'flac'],
-    );
-    final path = result?.files.single.path;
-    if (path == null) return;
-    final problem = await widget.voice.setupProblem();
-    if (problem != null) {
-      _showError(problem);
-      return;
-    }
-    setState(() {
-      _dictating = true;
-      _voiceStatus = 'Converting speech from the file...';
-      _error = null;
-    });
-    try {
-      final text = await widget.voice.transcribeAny(path);
-      if (mounted) _addToInput(text);
-    } catch (e) {
-      _showError(e.toString().replaceFirst('Exception: ', ''));
-    } finally {
-      if (mounted) {
-        setState(() {
-          _dictating = false;
-          _voiceStatus = '';
-        });
-      }
-    }
-  }
-
-  Future<void> _downloadVoiceModel() async {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Downloading the voice model...'), behavior: SnackBarBehavior.floating),
-      );
-    }
-    try {
-      final msg = await widget.voice.downloadWhisperModel();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
-        );
-      }
-    } catch (e) {
-      _showError(e.toString().replaceFirst('Exception: ', ''));
-    }
   }
 
   // ---------- Voice ----------
@@ -1523,8 +1369,10 @@ class _TutorPageState extends State<TutorPage> {
       String heard;
       try {
         setState(() => _voiceStatus = 'Listening... speak now');
-        heard = await widget.voice.listenOnce(6);
+        final wav = await widget.voice.recordSeconds(6);
         if (!_voiceOn || !mounted) break;
+        setState(() => _voiceStatus = 'Understanding...');
+        heard = await widget.voice.transcribe(wav);
       } catch (e) {
         _showError(e.toString().replaceFirst('Exception: ', ''));
         break;
@@ -1732,20 +1580,6 @@ class _TutorPageState extends State<TutorPage> {
                 ),
               ),
               IconButton(
-                tooltip: 'Live voice',
-                onPressed: () => Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => LiveVoicePage(
-                      llama: widget.llama,
-                      voice: widget.voice,
-                      profile: widget.profile,
-                    ),
-                  ),
-                ),
-                icon: const Icon(Icons.graphic_eq),
-              ),
-              IconButton(
                 tooltip: 'My books',
                 onPressed: _showBooks,
                 icon: const Icon(Icons.menu_book_outlined),
@@ -1823,8 +1657,14 @@ class _TutorPageState extends State<TutorPage> {
             runSpacing: 8,
             children: [
               FilterChip(
+                avatar: const Icon(Icons.menu_book_outlined, size: 18),
+                label: const Text('Use my books'),
+                selected: _useBooks,
+                onSelected: _busy ? null : (v) => setState(() => _useBooks = v),
+              ),
+              FilterChip(
                 avatar: const Icon(Icons.lightbulb_outline, size: 18),
-                label: const Text('Deep think'),
+                label: const Text('Thinker'),
                 selected: _thinker,
                 onSelected: _busy ? null : (v) => setState(() => _thinker = v),
               ),
@@ -1836,7 +1676,7 @@ class _TutorPageState extends State<TutorPage> {
             ],
           ),
           const SizedBox(height: 8),
-          if (_voiceOn || _dictating)
+          if (_voiceOn)
             Padding(
               padding: const EdgeInsets.only(bottom: 6),
               child: Text(_voiceStatus, style: const TextStyle(fontWeight: FontWeight.w600)),
@@ -1844,18 +1684,8 @@ class _TutorPageState extends State<TutorPage> {
           if (_imageName != null) _attachmentPreview(),
           Row(
             children: [
-              IconButton(
-                tooltip: 'Dictate 8 seconds into the box',
-                onPressed: (_busy || _voiceOn || _dictating) ? null : _dictate,
-                icon: Icon(_dictating ? Icons.hearing : Icons.keyboard_voice),
-              ),
-              IconButton(
-                tooltip: 'Transcribe an audio file into the box',
-                onPressed: (_busy || _voiceOn || _dictating) ? null : _transcribeFile,
-                icon: const Icon(Icons.audio_file_outlined),
-              ),
               IconButton.filledTonal(
-                tooltip: _voiceOn ? 'Stop voice chat' : 'Voice chat (turn by turn)',
+                tooltip: _voiceOn ? 'Stop voice' : 'Start voice',
                 onPressed: _toggleVoice,
                 icon: Icon(_voiceOn ? Icons.mic_off : Icons.mic),
               ),
@@ -1896,6 +1726,168 @@ class _TutorPageState extends State<TutorPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ---------- Models ----------
+
+class ModelsPage extends StatefulWidget {
+  const ModelsPage({
+    super.key,
+    required this.service,
+    required this.loaded,
+    required this.status,
+    required this.lowMemory,
+    required this.onLowMemory,
+    required this.onLoad,
+    required this.onUnload,
+    required this.onMessage,
+  });
+
+  final ModelService service;
+  final bool loaded;
+  final String status;
+  final bool lowMemory;
+  final ValueChanged<bool> onLowMemory;
+  final VoidCallback onLoad;
+  final VoidCallback onUnload;
+  final ValueChanged<String> onMessage;
+
+  @override
+  State<ModelsPage> createState() => _ModelsPageState();
+}
+
+class _ModelsPageState extends State<ModelsPage> {
+  List<String> _available = [];
+  List<String> _local = [];
+  bool _checking = false;
+  bool _downloading = false;
+  double _progress = 0;
+  String _downloadName = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshLocal();
+  }
+
+  Future<void> _refreshLocal() async {
+    final files = await widget.service.localModels();
+    if (mounted) setState(() => _local = files);
+  }
+
+  Future<void> _discover() async {
+    setState(() => _checking = true);
+    try {
+      final files = await widget.service.discoverFiles();
+      if (mounted) setState(() => _available = files);
+    } catch (e) {
+      widget.onMessage(e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _checking = false);
+    }
+  }
+
+  Future<void> _download(String file) async {
+    setState(() {
+      _downloading = true;
+      _progress = 0;
+      _downloadName = file;
+    });
+    try {
+      await widget.service.download(file, (received, total) {
+        if (mounted && total > 0) setState(() => _progress = received / total);
+      });
+      widget.onMessage('Downloaded $file');
+      await _refreshLocal();
+    } catch (e) {
+      widget.onMessage(e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(20),
+      children: [
+        Text(
+          'Models',
+          style: Theme.of(context)
+              .textTheme
+              .headlineSmall
+              ?.copyWith(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 4),
+        Text('Status: ${widget.status}'),
+        const SizedBox(height: 12),
+        SwitchListTile(
+          value: widget.lowMemory,
+          onChanged: widget.onLowMemory,
+          title: const Text('Low-memory mode'),
+          subtitle: const Text('Use a smaller context and skip the image projector.'),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 10,
+          runSpacing: 8,
+          children: [
+            OutlinedButton.icon(
+              onPressed: _checking ? null : _discover,
+              icon: const Icon(Icons.cloud_download_outlined),
+              label: Text(_checking ? 'Checking...' : 'Find model files'),
+            ),
+            FilledButton.icon(
+              onPressed: widget.loaded || _local.isEmpty ? null : widget.onLoad,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Load model'),
+            ),
+            if (widget.loaded)
+              OutlinedButton.icon(
+                onPressed: widget.onUnload,
+                icon: const Icon(Icons.stop),
+                label: const Text('Unload'),
+              ),
+          ],
+        ),
+        if (_downloading) ...[
+          const SizedBox(height: 12),
+          Text('Downloading $_downloadName'),
+          LinearProgressIndicator(value: _progress > 0 ? _progress : null),
+        ],
+        const SizedBox(height: 16),
+        Text('Available online', style: Theme.of(context).textTheme.titleMedium),
+        if (_available.isEmpty)
+          const Text('Press "Find model files" to list downloads.')
+        else
+          for (final f in _available)
+            Card(
+              child: ListTile(
+                title: Text('$assistantDisplayName model file'),
+                trailing: IconButton(
+                  tooltip: 'Download',
+                  icon: const Icon(Icons.download),
+                  onPressed: _downloading ? null : () => _download(f),
+                ),
+              ),
+            ),
+        const SizedBox(height: 16),
+        Text('On this PC', style: Theme.of(context).textTheme.titleMedium),
+        if (_local.isEmpty)
+          const Text('No model downloaded yet.')
+        else
+          ...List.generate(
+            _local.length,
+            (_) => Card(
+              child: ListTile(
+                leading: const Icon(Icons.memory, color: brandBlue),
+                title: Text('$assistantDisplayName (installed)'),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }
